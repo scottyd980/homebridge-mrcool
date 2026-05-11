@@ -5,6 +5,7 @@ import { API, AccessoryConfig, AccessoryPlugin, CharacteristicGetCallback, Chara
 interface MrCoolConfig extends AccessoryConfig {
   ip?: string; // optional for typing; enforced at runtime
   mac?: string;
+  climateEntityId?: string; // optional explicit climate entity id (e.g. climate-air_conditioner)
   name: string;
   pollInterval?: number; // seconds
   enableFanOnly?: boolean;
@@ -19,7 +20,7 @@ interface MrCoolConfig extends AccessoryConfig {
 }
 
 // Known internal modes we will use
- type InternalMode = 'off' | 'cool' | 'heat' | 'auto' | 'fan' | 'dry';
+type InternalMode = 'off' | 'cool' | 'heat' | 'auto' | 'fan' | 'dry';
 
 export class MrCoolSmartLightAccessory implements AccessoryPlugin {
   private readonly log: Logging;
@@ -39,6 +40,8 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
 
   private currentTemp = 22;
   private targetTemp = 22;
+  private heatingThresholdTemp = 21;
+  private coolingThresholdTemp = 23;
   private outdoorTemp: number = NaN;
   private beeperOn: boolean = false;
   private currentState!: number; // HomeKit current heating/cooling state
@@ -60,6 +63,10 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
   private currentPreset: string = 'NONE';
   private currentSwingMode: string = 'OFF';
 
+  private normalizeClimateEntityId(id: string): string {
+    return id.startsWith('climate-') ? id : `climate-${id}`;
+  }
+
   constructor(log: Logging, config: MrCoolConfig, api: API) {
     this.log = log;
     this.config = config;
@@ -68,6 +75,10 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
 
     if (!config.ip && !config.mock) {
       throw new Error('MrCoolSmartLight: ip is required unless mock=true');
+    }
+
+    if (typeof config.climateEntityId === 'string' && config.climateEntityId.trim().length > 0) {
+      this.climateEntityId = this.normalizeClimateEntityId(config.climateEntityId.trim());
     }
 
     this.currentState = this.hap.Characteristic.CurrentHeatingCoolingState.OFF;
@@ -103,8 +114,26 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
       minStep: 0.5,
     });
 
-    this.thermostatService.getCharacteristic(this.hap.Characteristic.TemperatureDisplayUnits)
-      .on('get', (cb: CharacteristicGetCallback) => cb(null, this.hap.Characteristic.TemperatureDisplayUnits.CELSIUS));
+    this.thermostatService.getCharacteristic(this.hap.Characteristic.HeatingThresholdTemperature)
+      .on('get', this.handleHeatingThresholdTempGet.bind(this))
+      .on('set', this.handleHeatingThresholdTempSet.bind(this));
+
+    this.thermostatService.getCharacteristic(this.hap.Characteristic.CoolingThresholdTemperature)
+      .on('get', this.handleCoolingThresholdTempGet.bind(this))
+      .on('set', this.handleCoolingThresholdTempSet.bind(this));
+
+    this.thermostatService.getCharacteristic(this.hap.Characteristic.HeatingThresholdTemperature).setProps({
+      minValue: 16,
+      maxValue: 30,
+      minStep: 0.5,
+    });
+
+    this.thermostatService.getCharacteristic(this.hap.Characteristic.CoolingThresholdTemperature).setProps({
+      minValue: 16,
+      maxValue: 30,
+      minStep: 0.5,
+    });
+
 
     // Humidity (placeholder)
     this.humidityService = new this.hap.Service.HumiditySensor(config.name + ' Humidity');
@@ -163,7 +192,7 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
 
     // Optional preset switches (BOOST / ECO / SLEEP) – experimental: device appears to ignore preset changes in testing.
     if (config.enablePresets) {
-      ['BOOST','ECO','SLEEP'].forEach(preset => {
+      ['BOOST', 'ECO', 'SLEEP'].forEach(preset => {
         const svc = new this.hap.Service.Switch(`${config.name} ${preset} Preset`, `preset-${preset}`);
         svc.getCharacteristic(this.hap.Characteristic.On)
           .on('get', (cb: CharacteristicGetCallback) => cb(null, this.currentPreset === preset))
@@ -227,7 +256,7 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
     switch (mode) {
       case 'cool': this.targetState = t.COOL; break;
       case 'heat': this.targetState = t.HEAT; break;
-      case 'auto': this.targetState = t.AUTO; break;
+      case 'auto': this.targetState = t.AUTO; this.syncTargetTempFromAutoRange(); break;
       case 'off': case 'fan': case 'dry': this.targetState = t.OFF; break; // fan & dry not native -> OFF target
     }
     this.applyInternalModeToCurrent();
@@ -237,12 +266,9 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
 
   private applyInternalModeToCurrent() {
     const c = this.hap.Characteristic.CurrentHeatingCoolingState;
-    switch (this.internalMode) {
+    switch (this.getEffectiveMode()) {
       case 'cool': this.currentState = c.COOL; break;
       case 'heat': this.currentState = c.HEAT; break;
-      case 'auto': // infer
-        if (this.targetTemp < this.currentTemp - 0.3) this.currentState = c.COOL; else if (this.targetTemp > this.currentTemp + 0.3) this.currentState = c.HEAT; else this.currentState = c.OFF;
-        break;
       case 'fan':
       case 'dry':
       case 'off':
@@ -255,7 +281,6 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
     if (this.config.mock) return; // no outbound when mocking
     if (this.pendingSendTimer) clearTimeout(this.pendingSendTimer);
     this.pendingSendTimer = setTimeout(() => this.flushPendingSend().catch(err => this.debug('flushPendingSend error', err)), this.debounceMs);
-  this.pendingSendTimer = setTimeout(() => this.flushPendingSend().catch(() => undefined), this.debounceMs);
   }
 
   private buildDeviceMode(): string {
@@ -267,12 +292,71 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
       fan: 'FAN_ONLY',
       dry: 'DRY',
     };
-    return deviceModeMap[this.internalMode];
+    return deviceModeMap[this.getEffectiveMode()];
   }
 
   private roundTemp(v: number): number { // ensure we honor 0.5 step
     const stepped = Math.round(v * 2) / 2;
     return stepped;
+  }
+
+  private clampTemp(v: number): number {
+    return Math.min(30, Math.max(16, this.roundTemp(v)));
+  }
+
+  private normalizeAutoThresholds(changed: 'heat' | 'cool' | 'none' = 'none') {
+    this.heatingThresholdTemp = this.clampTemp(this.heatingThresholdTemp);
+    this.coolingThresholdTemp = this.clampTemp(this.coolingThresholdTemp);
+
+    if (this.coolingThresholdTemp - this.heatingThresholdTemp < 0.5) {
+      if (changed === 'heat') {
+        this.coolingThresholdTemp = this.clampTemp(this.heatingThresholdTemp + 0.5);
+        if (this.coolingThresholdTemp - this.heatingThresholdTemp < 0.5) {
+          this.heatingThresholdTemp = this.clampTemp(this.coolingThresholdTemp - 0.5);
+        }
+      } else if (changed === 'cool') {
+        this.heatingThresholdTemp = this.clampTemp(this.coolingThresholdTemp - 0.5);
+        if (this.coolingThresholdTemp - this.heatingThresholdTemp < 0.5) {
+          this.coolingThresholdTemp = this.clampTemp(this.heatingThresholdTemp + 0.5);
+        }
+      } else {
+        const midpoint = this.roundTemp((this.heatingThresholdTemp + this.coolingThresholdTemp) / 2);
+        this.heatingThresholdTemp = this.clampTemp(midpoint - 0.5);
+        this.coolingThresholdTemp = this.clampTemp(midpoint + 0.5);
+      }
+    }
+  }
+
+  private syncTargetTempFromAutoRange() {
+    this.targetTemp = this.roundTemp((this.heatingThresholdTemp + this.coolingThresholdTemp) / 2);
+  }
+
+  private setAutoRangeFromTarget(center: number) {
+    const currentSpan = Math.max(0.5, this.coolingThresholdTemp - this.heatingThresholdTemp);
+    const halfSpan = Math.max(0.25, currentSpan / 2);
+    this.heatingThresholdTemp = this.clampTemp(center - halfSpan);
+    this.coolingThresholdTemp = this.clampTemp(center + halfSpan);
+    this.normalizeAutoThresholds();
+    this.syncTargetTempFromAutoRange();
+  }
+
+  private getEffectiveMode(): Exclude<InternalMode, 'auto'> {
+    if (this.internalMode !== 'auto') return this.internalMode;
+    this.normalizeAutoThresholds();
+    if (this.currentTemp <= this.heatingThresholdTemp) return 'heat';
+    if (this.currentTemp >= this.coolingThresholdTemp) return 'cool';
+    return 'off';
+  }
+
+  private getEffectiveTargetTemp(): number {
+    if (this.internalMode !== 'auto') {
+      return this.roundTemp(this.targetTemp);
+    }
+
+    const effectiveMode = this.getEffectiveMode();
+    if (effectiveMode === 'heat') return this.heatingThresholdTemp;
+    if (effectiveMode === 'cool') return this.coolingThresholdTemp;
+    return this.lastSentTarget === undefined ? this.targetTemp : this.lastSentTarget;
   }
 
   private async flushPendingSend() {
@@ -282,13 +366,11 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
     if (!this.climateEntityId) {
       this.debug('Deferring send; climate entity not yet discovered');
       // retry shortly until SSE gives us the entity id
-      this.pendingSendTimer = setTimeout(() => this.flushPendingSend().catch(()=>undefined), 1500);
+      this.pendingSendTimer = setTimeout(() => this.flushPendingSend().catch(() => undefined), 1500);
       return;
     }
     const deviceMode = this.buildDeviceMode();
-    // Round temperature to device step (0.5) and keep one decimal
-    this.targetTemp = this.roundTemp(this.targetTemp);
-    const desiredTarget = this.targetTemp;
+    const desiredTarget = this.getEffectiveTargetTemp();
 
     const params: string[] = [];
     if (deviceMode !== this.lastSentMode) params.push(`mode=${encodeURIComponent(deviceMode)}`);
@@ -304,15 +386,20 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
     // Device silently ignores fan_mode changes so we skip sending fan_mode entirely for now.
     const endpoint = `http://${ip}/climate/${this.climateEntityId.replace('climate-', '')}/set?${params.join('&')}`;
     this.debug('Sending diff to device', endpoint);
-  // sending diff to device (debug removed)
-  // no diff to send
-  // deferring send; climate entity not yet discovered
+    // sending diff to device (debug removed)
+    // no diff to send
+    // deferring send; climate entity not yet discovered
     try {
+      this.startAck(
+        params.some(p => p.startsWith('mode=')) ? deviceMode : undefined,
+        params.some(p => p.startsWith('target_temperature=')) ? desiredTarget : undefined,
+      );
       await axios.post(endpoint, undefined, { timeout: 5000 });
       // Optimistically update lastSent markers (SSE confirmation will reconcile internalMode/targetTemp anyway)
       if (params.some(p => p.startsWith('mode='))) this.lastSentMode = deviceMode;
       if (params.some(p => p.startsWith('target_temperature='))) this.lastSentTarget = desiredTarget;
     } catch (e: any) {
+      this.pendingAck = undefined;
       this.log.warn('Command POST failed', e.message || e);
     }
   }
@@ -322,6 +409,7 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
       // Simulate drift and cyclic modes
       this.currentTemp += (Math.random() - 0.5) * 0.2;
       this.applyInternalModeToCurrent();
+      if (this.internalMode === 'auto') this.scheduleSyncToDevice();
       this.updateCharacteristics();
       return;
     }
@@ -331,6 +419,8 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
   private updateCharacteristics() {
     this.thermostatService.updateCharacteristic(this.hap.Characteristic.CurrentTemperature, this.currentTemp);
     this.thermostatService.updateCharacteristic(this.hap.Characteristic.TargetTemperature, this.targetTemp);
+    this.thermostatService.updateCharacteristic(this.hap.Characteristic.HeatingThresholdTemperature, this.heatingThresholdTemp);
+    this.thermostatService.updateCharacteristic(this.hap.Characteristic.CoolingThresholdTemperature, this.coolingThresholdTemp);
     this.thermostatService.updateCharacteristic(this.hap.Characteristic.CurrentHeatingCoolingState, this.currentState);
     this.thermostatService.updateCharacteristic(this.hap.Characteristic.TargetHeatingCoolingState, this.targetState);
     if (this.humidityService) this.humidityService.updateCharacteristic(this.hap.Characteristic.CurrentRelativeHumidity, this.humidity);
@@ -358,7 +448,36 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
   private handleCurrentTempGet(callback: CharacteristicGetCallback) { callback(null, this.currentTemp); }
   private handleTargetTempGet(callback: CharacteristicGetCallback) { callback(null, this.targetTemp); }
   private handleTargetTempSet(value: CharacteristicValue, callback: CharacteristicSetCallback) {
-    this.targetTemp = value as number;
+    const nextTarget = value as number;
+    if (this.internalMode === 'auto') {
+      this.setAutoRangeFromTarget(nextTarget);
+    } else {
+      this.targetTemp = nextTarget;
+    }
+    this.applyInternalModeToCurrent();
+    this.scheduleSyncToDevice();
+    this.updateCharacteristics();
+    callback(null);
+  }
+
+  private handleHeatingThresholdTempGet(callback: CharacteristicGetCallback) { callback(null, this.heatingThresholdTemp); }
+
+  private handleCoolingThresholdTempGet(callback: CharacteristicGetCallback) { callback(null, this.coolingThresholdTemp); }
+
+  private handleHeatingThresholdTempSet(value: CharacteristicValue, callback: CharacteristicSetCallback) {
+    this.heatingThresholdTemp = this.clampTemp(value as number);
+    this.normalizeAutoThresholds('heat');
+    this.syncTargetTempFromAutoRange();
+    this.applyInternalModeToCurrent();
+    this.scheduleSyncToDevice();
+    this.updateCharacteristics();
+    callback(null);
+  }
+
+  private handleCoolingThresholdTempSet(value: CharacteristicValue, callback: CharacteristicSetCallback) {
+    this.coolingThresholdTemp = this.clampTemp(value as number);
+    this.normalizeAutoThresholds('cool');
+    this.syncTargetTempFromAutoRange();
     this.applyInternalModeToCurrent();
     this.scheduleSyncToDevice();
     this.updateCharacteristics();
@@ -368,7 +487,7 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
   getServices(): Service[] {
     const base = [this.informationService, this.thermostatService];
     if (this.humidityService) base.push(this.humidityService);
-  if (this.outdoorTempService) base.push(this.outdoorTempService);
+    if (this.outdoorTempService) base.push(this.outdoorTempService);
     if (this.fanOnlySwitch) base.push(this.fanOnlySwitch);
     if (this.dryModeSwitch) base.push(this.dryModeSwitch);
     Object.values(this.presetSwitches).forEach(s => base.push(s));
@@ -383,7 +502,7 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
     if (!this.config.ip) return;
     const url = `http://${this.config.ip}/events`;
     this.debug('Connecting SSE', url);
-  // connecting SSE
+    // connecting SSE
     try {
       this.es = new EventSource(url);
     } catch (e: any) {
@@ -401,7 +520,7 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
 
     this.es.onmessage = (evt: MessageEvent) => {
       // Generic messages (without event field) might not appear; we rely on typed handlers below
-      this.debug('SSE message', evt.data?.slice(0,120));
+      this.debug('SSE message', evt.data?.slice(0, 120));
     };
 
     this.es.addEventListener('ping', (ev: MessageEvent) => {
@@ -412,7 +531,7 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
       try {
         const data = JSON.parse(ev.data);
         if (this.config.debug && data && data.id) {
-        // debug removed: SSE state id
+          // debug removed: SSE state id
         }
         if (!data || !data.id) return;
         if (data.id.startsWith('climate-')) {
@@ -420,12 +539,12 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
         } else if (data.id === 'sensor-air_conditioner_indoor_humidity' && typeof data.value === 'number') {
           this.humidity = data.value;
           if (this.humidityService) this.humidityService.updateCharacteristic(this.hap.Characteristic.CurrentRelativeHumidity, this.humidity);
-  } else if (data.id.startsWith('sensor-air_conditioner_outdoor_temperature')) {
+        } else if (data.id.startsWith('sensor-air_conditioner_outdoor_temperature')) {
           const valRaw = data.value;
           let val: number = NaN;
-            if (typeof valRaw === 'number') val = valRaw; else if (typeof valRaw === 'string') {
-              const parsed = parseFloat(valRaw); if (!isNaN(parsed)) val = parsed;
-            }
+          if (typeof valRaw === 'number') val = valRaw; else if (typeof valRaw === 'string') {
+            const parsed = parseFloat(valRaw); if (!isNaN(parsed)) val = parsed;
+          }
           if (!isNaN(val)) {
             this.outdoorTemp = val;
             if (this.outdoorTempService) this.outdoorTempService.updateCharacteristic(this.hap.Characteristic.CurrentTemperature, this.outdoorTemp);
@@ -434,24 +553,24 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
           }
         } else if (data.id === 'switch-air_conditioner_beeper' && typeof data.value === 'string') {
           const v = data.value.toLowerCase();
-            const on = v === 'on';
-            if (this.beeperOn !== on) {
-              this.beeperOn = on;
-              this.beeperSwitch?.updateCharacteristic(this.hap.Characteristic.On, this.beeperOn);
-              this.debug('Beeper state update', this.beeperOn);
-              // beeper state update
-            }
+          const on = v === 'on';
+          if (this.beeperOn !== on) {
+            this.beeperOn = on;
+            this.beeperSwitch?.updateCharacteristic(this.hap.Characteristic.On, this.beeperOn);
+            this.debug('Beeper state update', this.beeperOn);
+            // beeper state update
+          }
         }
       } catch (e: any) {
         this.debug('Failed to parse state event', e.message || e);
-  // failed to parse state event
+        // failed to parse state event
       }
     });
 
     this.es.addEventListener('log', (ev: MessageEvent) => {
       // Could parse internal debug; ignore for now unless debug enabled
       if (this.config.debug) {
-      // device internal log ignored
+        // device internal log ignored
       }
     });
 
@@ -479,7 +598,7 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
   private handleClimateState(data: any) {
     // Raw debug before any mapping so we can diagnose mismatches
     this.debug('SSE climate raw', {
-  /* debug removed: SSE climate raw */
+      /* debug removed: SSE climate raw */
       id: data.id,
       mode: data.mode,
       current_temperature: data.current_temperature,
@@ -488,13 +607,13 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
       swing_mode: data.swing_mode,
     });
     if (!this.climateEntityId) {
-      this.climateEntityId = data.id; // store full id e.g. climate-air_conditioner
+      this.climateEntityId = this.normalizeClimateEntityId(data.id); // store full id e.g. climate-air_conditioner
       this.debug('Discovered climate entity', this.climateEntityId);
-  // discovered climate entity
+      // discovered climate entity
       // Optionally auto-disable beeper once after discovery
       if (this.config.autoDisableBeeper) {
         this.disableBeeper().catch(err => this.debug('autoDisableBeeper failed', err));
-  this.disableBeeper().catch(() => undefined);
+        this.disableBeeper().catch(() => undefined);
       }
     }
     // Extract numbers (some come as strings)
@@ -502,7 +621,8 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
     const current = parseNum(data.current_temperature);
     const target = parseNum(data.target_temperature);
     if (!isNaN(current)) this.currentTemp = current;
-    if (!isNaN(target)) this.targetTemp = target;
+    if (!isNaN(target) && this.internalMode !== 'auto') this.targetTemp = target;
+    if (this.internalMode === 'auto') this.syncTargetTempFromAutoRange();
 
     if (typeof data.mode === 'string') {
       const mode = data.mode.toUpperCase();
@@ -515,10 +635,10 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
         'DRY': 'dry',
       };
       const internal = map[mode];
-      if (internal) this.internalMode = internal;
+      if (internal && this.internalMode !== 'auto') this.internalMode = internal;
       // Also update targetState to reflect device-reported mode (previously only updated when user initiated change)
       const t = this.hap.Characteristic.TargetHeatingCoolingState;
-      switch (this.internalMode) {
+      switch (this.internalMode === 'auto' ? 'auto' : this.internalMode) {
         case 'cool': this.targetState = t.COOL; break;
         case 'heat': this.targetState = t.HEAT; break;
         case 'auto': this.targetState = t.AUTO; break;
@@ -543,9 +663,10 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
     }
     this.checkAckSatisfied();
     this.applyInternalModeToCurrent();
+    if (this.internalMode === 'auto') this.scheduleSyncToDevice();
     this.updateCharacteristics();
     this.debug('SSE climate mapped', {
-  /* debug removed: SSE climate mapped */
+      /* debug removed: SSE climate mapped */
       internalMode: this.internalMode,
       currentTemp: this.currentTemp,
       targetTemp: this.targetTemp,
@@ -560,9 +681,9 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
   private async requestPreset(preset: string) {
     if (this.config.mock) { this.currentPreset = preset; this.updateCharacteristics(); return; }
     if (!this.config.ip || !this.climateEntityId) return;
-    const endpoint = `http://${this.config.ip}/climate/${this.climateEntityId.replace('climate-','')}/set?preset=${encodeURIComponent(preset)}`;
+    const endpoint = `http://${this.config.ip}/climate/${this.climateEntityId.replace('climate-', '')}/set?preset=${encodeURIComponent(preset)}`;
     this.debug('Sending preset request', endpoint);
-  // sending preset request (debug removed)
+    // sending preset request (debug removed)
     try { await axios.post(endpoint, undefined, { timeout: 4000 }); } catch (e: any) { this.log.warn('Preset request failed', e.message || e); }
     // We rely on SSE to update; if not changed, switch will revert on next updateCharacteristics call triggered by other events.
   }
@@ -570,9 +691,9 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
   private async requestSwing(swing: string) {
     if (this.config.mock) { this.currentSwingMode = swing; this.updateCharacteristics(); return; }
     if (!this.config.ip || !this.climateEntityId) return;
-    const endpoint = `http://${this.config.ip}/climate/${this.climateEntityId.replace('climate-','')}/set?swing_mode=${encodeURIComponent(swing)}`;
+    const endpoint = `http://${this.config.ip}/climate/${this.climateEntityId.replace('climate-', '')}/set?swing_mode=${encodeURIComponent(swing)}`;
     this.debug('Sending swing request', endpoint);
-  // sending swing request (debug removed)
+    // sending swing request (debug removed)
     try { await axios.post(endpoint, undefined, { timeout: 4000 }); } catch (e: any) { this.log.warn('Swing request failed', e.message || e); }
   }
 
@@ -580,9 +701,9 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
     if (this.config.mock || !this.config.ip) return;
     const endpoint = `http://${this.config.ip}/switch/air_conditioner_beeper/turn_off`;
     this.debug('Auto disabling beeper');
-  // auto disabling beeper
+    // auto disabling beeper
     try { await axios.post(endpoint, undefined, { timeout: 3000 }); } catch (e: any) { this.debug('disableBeeper error', e.message || e); }
-  try { await axios.post(endpoint, undefined, { timeout: 3000 }); } catch { /* ignore */ }
+    try { await axios.post(endpoint, undefined, { timeout: 3000 }); } catch { /* ignore */ }
   }
 
   private startAck(expectedMode?: string, expectedTarget?: number) {
@@ -603,7 +724,7 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
     if (typeof expected.expectedTarget === 'number' && Math.abs(this.targetTemp - expected.expectedTarget) > 0.001) satisfied = false;
     if (satisfied) {
       this.debug('Ack satisfied for mode/temperature change');
-  // ack satisfied
+      // ack satisfied
       this.pendingAck = undefined;
     }
   }
@@ -614,7 +735,7 @@ export class MrCoolSmartLightAccessory implements AccessoryPlugin {
     const action = on ? 'turn_on' : 'turn_off';
     const endpoint = `http://${this.config.ip}/switch/air_conditioner_beeper/${action}`;
     this.debug('Beeper request', endpoint);
-  // beeper request
+    // beeper request
     try { await axios.post(endpoint, undefined, { timeout: 3000 }); } catch (err: any) { this.log.warn('Beeper request failed', err.message || err); }
   }
 

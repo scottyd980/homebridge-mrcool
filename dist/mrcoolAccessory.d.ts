@@ -2,6 +2,7 @@ import { API, AccessoryConfig, AccessoryPlugin, Logging, Service } from 'homebri
 interface MrCoolConfig extends AccessoryConfig {
     ip?: string;
     mac?: string;
+    climateEntityId?: string;
     name: string;
     pollInterval?: number;
     enableFanOnly?: boolean;
@@ -30,6 +31,8 @@ export declare class MrCoolSmartLightAccessory implements AccessoryPlugin {
     private beeperSwitch?;
     private currentTemp;
     private targetTemp;
+    private heatingThresholdTemp;
+    private coolingThresholdTemp;
     private outdoorTemp;
     private beeperOn;
     private currentState;
@@ -48,6 +51,7 @@ export declare class MrCoolSmartLightAccessory implements AccessoryPlugin {
     private pendingAck?;
     private currentPreset;
     private currentSwingMode;
+    private normalizeClimateEntityId;
     constructor(log: Logging, config: MrCoolConfig, api: API);
     private debug;
     private setInternalMode;
@@ -55,6 +59,12 @@ export declare class MrCoolSmartLightAccessory implements AccessoryPlugin {
     private scheduleSyncToDevice;
     private buildDeviceMode;
     private roundTemp;
+    private clampTemp;
+    private normalizeAutoThresholds;
+    private syncTargetTempFromAutoRange;
+    private setAutoRangeFromTarget;
+    private getEffectiveMode;
+    private getEffectiveTargetTemp;
     private flushPendingSend;
     private pollStatus;
     private updateCharacteristics;
@@ -64,6 +74,10 @@ export declare class MrCoolSmartLightAccessory implements AccessoryPlugin {
     private handleCurrentTempGet;
     private handleTargetTempGet;
     private handleTargetTempSet;
+    private handleHeatingThresholdTempGet;
+    private handleCoolingThresholdTempGet;
+    private handleHeatingThresholdTempSet;
+    private handleCoolingThresholdTempSet;
     getServices(): Service[];
     private connectEventStream;
     private scheduleReconnect;

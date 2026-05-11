@@ -5,7 +5,7 @@ Homebridge plugin providing local (cloud‑independent) control of a MrCool HVAC
 > Status: Early preview. Core thermostat + outdoor temperature + beeper work reliably. Preset / swing features are exposed optionally but the device currently ignores those commands. Removed non‑functional Display / Swing Step buttons to keep the UI clean.
 
 ### Working Today
-* Thermostat: OFF / HEAT / COOL / AUTO (HEAT_COOL) + current & target temperature (16–30°C, 0.5° steps)
+* Thermostat: OFF / HEAT / COOL / AUTO (HEAT_COOL) + current temperature, target temperature, and AUTO heating/cooling thresholds (16–30°C, 0.5° steps)
 * Current relative humidity (if provided by climate entity)
 * Outdoor temperature sensor (separate TemperatureSensor)
 * Beeper on/off switch (stateful)
@@ -70,6 +70,7 @@ Extended (with options):
   "name": "MrCool HVAC",
   "ip": "192.168.40.149",
   "mac": "f8:b3:b7:8a:d6:b8",
+  "climateEntityId": "climate-air_conditioner",
   "commandDebounceMs": 450,
   "ackTimeoutMs": 5000,
   "autoDisableBeeper": true,
@@ -86,6 +87,7 @@ Extended (with options):
 |-----|------|---------|-------------|
 | `ip` | string | (required) | IPv4/host of the SMARTLIGHT module. |
 | `mac` | string | (recommended) | MAC used for stable UUID (prevents accessory duplication). |
+| `climateEntityId` | string | auto-discovered | Explicit climate entity id (e.g. `climate-air_conditioner`) if SSE discovery is delayed/missing. |
 | `commandDebounceMs` | number | 450 | Merge rapid HomeKit changes before sending to device. |
 | `ackTimeoutMs` | number | 5000 | Warn if SSE doesn’t reflect sent change within this window. |
 | `autoDisableBeeper` | boolean | false | Automatically turns beeper off after connecting. |
@@ -99,6 +101,7 @@ Extended (with options):
 ## How It Works
 * Subscribes to `/events` SSE endpoint; parses climate, sensor, and switch state ids.
 * Maintains internal cached state; reconciles HomeKit commands vs. device reports.
+* AUTO mode uses HomeKit heating/cooling threshold temperatures as a synthetic range and switches the device between HEAT/COOL/OFF as the room temperature crosses those bounds.
 * Sends updates via `POST /climate/<id>/set?mode=...&target_temperature=...` (only when changed).
 * Beeper switch maps to `/switch/air_conditioner_beeper/(turn_on|turn_off)`.
 * Optional commands for presets/swing are issued but currently produce no state change.
@@ -109,6 +112,7 @@ If the module firmware begins honoring ignored parameters, the exposed optional 
 ## Known Limitations
 * No fan speed granularity (only implicit via thermostat modes).
 * Preset & swing currently inert (device returns HTTP 200 without state mutation).
+* AUTO is synthetic: the device still receives ordinary HEAT/COOL/OFF commands plus the matching setpoint for the active side of the range.
 * No caching across restarts beyond what HomeKit retains.
 * Single-unit support per accessory instance (add multiple accessories for multiple units).
 
@@ -117,6 +121,7 @@ If the module firmware begins honoring ignored parameters, the exposed optional 
 | Symptom | Suggestion |
 |---------|------------|
 | Thermostat stuck / no updates | Enable `debug`, restart, confirm climate SSE events appear. |
+| Values don’t apply from HomeKit | Set `climateEntityId` explicitly (usually `climate-air_conditioner`) so writes don’t wait on SSE discovery. |
 | Commands delayed | Lower `commandDebounceMs` (e.g. 200) but keep >150ms to avoid floods. |
 | Ack timeout warnings | Verify device actually changed; network latency; increase `ackTimeoutMs`. |
 | Duplicate accessories | Ensure `mac` is set and stable. Remove cached accessory from Homebridge UI. |
